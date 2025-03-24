@@ -58,6 +58,56 @@ def fit_model(raw_data, precompiled=True, modelname='model_4comp_SE', date_nowca
     
     return fit, results
 
+import os 
+
+def fit_model_daily(raw_data, precompiled=True, modelname='model_4comp_SE', date_nowcast=None,
+                    maxD=10, iters=1000, warmup=400, chains=4, adapt_delta=0.9,
+                    max_treedepth=12, seed=9876,
+                    pickle_run=False, save=True, savepath=''):
+    
+    # 1. Prepare the data
+    data = raw_data.copy()
+    data['Release_index'] = data['Release'].astype('category').cat.codes
+    data = data[data['Date'] >= '2020-06-30']
+    data = data[data['Release'] >= '2020-06-30']
+
+    # 2. Set nowcasting date if not provided
+    if date_nowcast is None:
+        date_nowcast = data['Date'].values[-1]
+
+    # 3. Prepare the daily reporting triangle and cleaned data
+    delays_data, triangle = nowcasting_daily_prep(data, date_nowcast, maxD=maxD)
+
+    # 4. Load or use provided model
+    if precompiled:
+        model = get_model(modelname)  # should return a compiled pystan model
+    else:
+        model = modelname  # assume already compiled or custom logic outside
+
+    # 5. Fit the model
+    fit = fit_single_model(
+        model, triangle,
+        iters=iters,
+        warmup=warmup,
+        chains=chains,
+        adapt_delta=adapt_delta,
+        max_treedepth=max_treedepth,
+        seed=seed
+    )
+
+    # 6. Optionally pickle the fit object
+    if pickle_run:
+        pickle_file = os.path.join(savepath, f"{modelname}_{date_nowcast}.pkl")
+        with open(pickle_file, "wb") as f:
+            pickle.dump({'fit': fit}, f, protocol=-1)
+
+    # 7. Optionally save or return results
+    savefile = os.path.join(savepath, f"{modelname}_{date_nowcast}.csv") if save else None
+    results = get_results_df(fit, savefile=savefile)
+
+    return fit, results, delays_data, triangle
+
+
 ##############################################################################
 # DATA PREPARATION FUNCTIONS
 ##############################################################################
@@ -156,16 +206,16 @@ def test_reporting_triangle(triangle):
     return True    
 
 def mask_below_diagonal(triangle):
-    """Makes all values below nan value to be nan"""
-    nrow = triangle.shape[0]
-    ncol = triangle.shape[1]
+    """Makes all values below the first NaN in each column NaN."""
+    nrow, ncol = triangle.shape
     masked_triangle = triangle.copy()
-    
+
     for c in range(1, ncol):
-        nan_idx = np.argwhere(np.isnan(masked_triangle.iloc[:,c].values))
-        if nan_idx:
-            for r in range(nan_idx[0][0], nrow):
-                masked_triangle.iloc[r,c] = np.nan
+        nan_idx = np.argwhere(np.isnan(masked_triangle.iloc[:, c].astype(float).values))
+        if nan_idx.size > 0:  # Ensure nan_idx is not empty
+            first_nan_row = nan_idx[0][0]  # Get the first NaN index in column
+            masked_triangle.iloc[first_nan_row:, c] = np.nan  # Mask below NaN
+
     return masked_triangle
 
     
@@ -216,6 +266,43 @@ def nowcasting_prep(data, now_date, maxD=10):
     triangle = triangle.astype('int32')
 
     return delays_data_weekly, triangle
+
+def nowcasting_daily_prep(data, now_date, maxD=10):
+    # Filter data up to now_date
+    data_filtered = data[data['Release'] <= now_date].copy()
+
+    # 1. Re-index releases to start from 0
+    releases = np.sort(data_filtered.Release_index.unique())
+    for i, release_idx in enumerate(releases):
+        data_filtered.loc[data_filtered["Release_index"] == release_idx, "Release_index"] = i
+
+    # 2. Create the reporting triangle: rows = event dates, cols = delays
+    delays_data = create_reporting_triangle(data_filtered)
+
+    # 3. Sum up delays greater than maxD
+    delays_data = sum_up_delays_above_max(delays_data, maxD)
+
+    # ⚠️ 4. NO WEEK BINNING: Keep dates at daily resolution
+    # So this block is removed:
+    # - No delays_data['week']
+    # - No groupby on 'week'
+    # - No masking due to irregular weekly reporting
+
+    # 4.5 Replace negative values (if any) with 0
+    delays_data[delays_data < 0] = 0
+
+    # 5. Add a total count of reported events for each day
+    delays_data["all_deaths"] = delays_data.sum(axis=1)
+
+    # 6. Create triangle and mask lower triangle
+    triangle = delays_data.iloc[:, :-1].copy()  # exclude 'all_deaths'
+    triangle = mask_bottom_triangle(triangle, np.nan)
+    triangle = mask_below_diagonal(triangle)
+    triangle.replace(np.nan, 10000000, inplace=True)
+    triangle = triangle.astype('int32')
+
+    return delays_data, triangle
+
 
 
 ##############################################################################
