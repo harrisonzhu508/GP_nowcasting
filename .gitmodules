@@ -1,2 +1,2 @@
 [submodule "path/to/submodule"]
-	url = https://github.com/harrisonzhu508/GP_nowcasting.git
+	url = git@github.com:harrisonzhu508/GP_nowcasting.git
